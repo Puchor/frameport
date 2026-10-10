@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from urllib.parse import urlencode
 
-from .. import REPO_URL as REPO
+from .. import UPSTREAM_REPO_URL as REPO
 from . import redact
 
 MAX_URL = 7500

@@ -80,6 +80,8 @@ SUMMARIES = {
                         "Aftermath).",
     "frame.hw_video_decode": "Plays the game's videos on the Frame's video hardware, so 4K and 8K video runs "
                              "smoothly.",
+    "frame.gamepad_passthrough": "Lets the game use your controllers as a gamepad instead of on-screen touch "
+                                 "controls.",
     "frame.tbxr_vendor": "Lets Team Beef ports (e.g. Lambda1VR) start on the Frame and use their Meta Quest setup.",
     "frame.asset_files": "Lets the game find content it keeps in separate files next to its data (e.g. Star Wars "
                          "Tales' seasons).",

@@ -7,6 +7,8 @@
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 ![Steam Frame](https://img.shields.io/badge/Steam%20Frame-supported-1b2838?logo=steam&logoColor=white)
 
+> **This is a fork** of [spoopyghosty0/frameport](https://github.com/spoopyghosty0/frameport) that adds controller passthrough for flat Android apps (patch "Pass controllers to the app as a gamepad"). It updates itself from this fork's releases; game configs still come from the original project.
+
 Install games that target the Meta Quest, Android, or general PCVR onto your **Valve Steam Frame**. FramePort handles everything from uploading game files, setting up your Frame, injecting compatibility patches, and adding shortcuts to your Steam library. FramePort aims to be as simple as possible by taking advantage of the fact that the Steam Frame runs on Linux.
 
 ![Library](docs/images/library.png)

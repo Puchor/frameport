@@ -2,5 +2,7 @@
 
 from ._version import __version__  # noqa: F401  (single source of the version)
 
-# Where the project lives (Settings → About, problem reports). Change it here if the repo moves.
-REPO_URL = "https://github.com/spoopyghosty0/frameport"
+# Where this build lives (Settings → About, self-update). This is a fork: it updates from its own releases.
+REPO_URL = "https://github.com/Puchor/frameport"
+# The original project: game configs (catalog updates) and problem reports still go there.
+UPSTREAM_REPO_URL = "https://github.com/spoopyghosty0/frameport"

@@ -108,7 +108,7 @@ GITHUB_DIR = "catalog/games/"
 
 
 def _repo() -> str:
-    from .. import REPO_URL
+    from .. import UPSTREAM_REPO_URL as REPO_URL
 
     return REPO_URL.removeprefix("https://github.com/").strip("/")
 

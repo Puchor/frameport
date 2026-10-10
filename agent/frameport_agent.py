@@ -44,7 +44,7 @@ try:
 except ImportError:  # Windows: pc_revive loads this file for its VDF code only (GitHub #131)
     fcntl = None
 
-AGENT_VERSION = 71
+AGENT_VERSION = 72
 HOME = os.path.expanduser("~")
 STEAM = os.path.join(HOME, ".local/share/Steam")
 ANCHORS = os.path.join(HOME, "Applications/quest-frame")
@@ -65,6 +65,188 @@ OLD_CODEC_LINES = ('[[ ! -x "$app_dir/frameport-codec/bin/podman" ]] || '
                    'export PATH="$app_dir/frameport-codec/bin:$PATH"',
                    'codec_bin="$HOME/.local/share/frameport/video-codec/current/bin"\n'
                    '[[ ! -x "$codec_bin/podman" ]] || export PATH="$codec_bin:$PATH"')
+
+
+# Gamepad passthrough (patch frame.gamepad_passthrough, per game): Lepton's Android only gets Wayland touch, pointer and
+# keyboard devices, so SDL/Android games never see a controller. Launchers of games whose recipe has the patch put a
+# small Podman wrapper first on Lepton's PATH; it bind-mounts Steam Input's virtual gamepads (evdev 28de:11ff, Xbox 360
+# layout; ACL'd to the steamos user) into that game's container, adds a key layout for them and drops init's keychords
+# (a keychord makes Android's init open every /dev/input node; Armada's Lepton found the boot hangs on Lepton's FIFOs
+# there once a real input device is present). SDL ignores Steam's virtual pad unless its hint is set: the launcher
+# passes it as LEPTON_ENV_SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD. One game: FRAMEPORT_NO_GAMEPAD=1.
+GAMEPAD_DIR = os.path.join(HOME, ".local/share/frameport/gamepad")
+GAMEPAD_PATCH = "frame.gamepad_passthrough"
+GAMEPAD_LINE = ('gamepad_bin="$HOME/.local/share/frameport/gamepad/bin"; [[ "${FRAMEPORT_NO_GAMEPAD:-0}" != 0 || '
+                '! -x "$gamepad_bin/podman" ]] || export PATH="$gamepad_bin:$PATH" '
+                'LEPTON_ENV_SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD=1')
+# Android's layout for Xbox 360 pads (AOSP Vendor_045e_Product_028e.kl), with the guide button as BUTTON_MODE instead
+# of HOME (HOME would leave the game for Lepton's launcher).
+GAMEPAD_KEYLAYOUT = """# Steam Input virtual gamepad (Xbox 360 layout). Written by FramePort.
+key 304   BUTTON_A
+key 305   BUTTON_B
+key 307   BUTTON_X
+key 308   BUTTON_Y
+key 310   BUTTON_L1
+key 311   BUTTON_R1
+key 314   BACK
+key 315   BUTTON_START
+key 316   BUTTON_MODE
+key 317   BUTTON_THUMBL
+key 318   BUTTON_THUMBR
+axis 0x00 X flat 4096
+axis 0x01 Y flat 4096
+axis 0x03 Z flat 4096
+axis 0x04 RZ flat 4096
+axis 0x02 LTRIGGER
+axis 0x05 RTRIGGER
+axis 0x10 HAT_X
+axis 0x11 HAT_Y
+"""
+GAMEPAD_PODMAN = r'''#!/usr/bin/python3
+"""FramePort gamepad passthrough: Steam Input's virtual gamepads into this game's Lepton container. Written by the
+FramePort agent. Any failure starts the container unchanged."""
+import hashlib
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BASE = HERE.parent
+PAD_IDS = {("28de", "11ff")}  # Steam Input's virtual gamepad
+SYS_INPUT = Path("/sys/class/input")
+DEV_INPUT = Path("/dev/input")
+INIT_DIRS = ("system/etc/init", "vendor/etc/init", "product/etc/init", "system_ext/etc/init")
+KEYCODES = re.compile(r"^[ \t]*keycodes\b[^\n]*\n?", re.M)
+
+
+def log(message):
+    print(f"FramePort gamepad: {message}", file=sys.stderr)
+
+
+def option(args, name):
+    for i, arg in enumerate(args):
+        if arg == name and i + 1 < len(args):
+            return args[i + 1]
+        if arg.startswith(name + "="):
+            return arg.partition("=")[2]
+    return None
+
+
+def pads():
+    found = []
+    for event in sorted(SYS_INPUT.glob("event*"), key=lambda p: int(p.name[5:] or 0)):
+        ids = event / "device" / "id"
+        try:
+            pair = ((ids / "vendor").read_text().strip().lower(), (ids / "product").read_text().strip().lower())
+        except OSError:
+            continue
+        if pair not in PAD_IDS:
+            continue
+        node = DEV_INPUT / event.name
+        if node.exists() and os.access(node, os.R_OK | os.W_OK):
+            found.append(node)
+        else:
+            log(f"{node} is a Steam Input gamepad but not accessible; skipped")
+    return found
+
+
+def runtime_dir():
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    base = Path(runtime) if runtime and Path(runtime).is_dir() else Path.home() / ".cache"
+    path = base / "frameport-gamepad"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path
+
+
+def write_once(folder, stem, text):
+    key = hashlib.sha256(text.encode()).hexdigest()[:16]
+    target = folder / f"{stem}.{key}"
+    if not target.is_file():
+        tmp = target.with_name(target.name + f".{os.getpid()}.tmp")
+        tmp.write_text(text)
+        tmp.replace(target)
+    return target
+
+
+def init_overrides(root):
+    """(host file, container path) for every init .rc with keychords, without them. None: the rootfs layout is
+    unknown (no init folder), so it can't be checked."""
+    folders = [rel for rel in INIT_DIRS if (root / rel).is_dir()]
+    if not folders:
+        return None
+    out = []
+    for rel in folders:
+        for rc in sorted((root / rel).glob("*.rc")):
+            text = rc.read_text(errors="replace")
+            if KEYCODES.search(text):
+                out.append((write_once(runtime_dir(), rc.name, KEYCODES.sub("", text)), f"/{rel}/{rc.name}"))
+    return out
+
+
+def mounts(args):
+    if not args or args[0] != "run":
+        return []
+    appid = os.environ.get("SteamAppId", "")
+    if not re.fullmatch(r"[0-9]+", appid) or option(args, "--name") != f"lepton-steamlaunch-{appid}":
+        return []
+    rootfs = option(args, "--rootfs")
+    if not rootfs:
+        log("no --rootfs in Lepton's podman run; container left unchanged")
+        return []
+    root = Path(rootfs[:-2] if rootfs.endswith(":O") else rootfs)
+    nodes = pads()
+    if not nodes:
+        log("no Steam Input gamepad found (turn a controller on before starting the game)")
+        return []
+    overrides = init_overrides(root)
+    if overrides is None:
+        log(f"unknown rootfs layout at {root}; container left unchanged")
+        return []
+    result = []
+    for node in nodes:
+        result += ["--mount", f"type=bind,source={node},destination=/dev/input/{node.name},rw"]
+    keylayout = BASE / "Vendor_28de_Product_11ff.kl"
+    if keylayout.is_file():
+        result += ["--mount", f"type=bind,source={keylayout},destination=/system/usr/keylayout/{keylayout.name},ro"]
+    for source, target in overrides:
+        result += ["--mount", f"type=bind,source={source},destination={target},ro"]
+    log("passing " + ", ".join(str(n) for n in nodes) + " to the game"
+        + (f" (keychords removed from {len(overrides)} init file(s))" if overrides else ""))
+    return result
+
+
+def next_podman():
+    """The next Podman on PATH after this wrapper (it may be FramePort's video codec wrapper, which chains on)."""
+    me = Path(__file__).resolve()
+    entries = os.environ.get("PATH", os.defpath).split(os.pathsep) + ["/usr/local/bin", "/usr/bin", "/bin"]
+    for entry in entries:
+        folder = Path(entry or os.curdir).resolve()
+        if folder == HERE:
+            continue
+        found = shutil.which("podman", path=str(folder))
+        if found and Path(found).resolve() != me:
+            return found
+    raise RuntimeError("no Podman found outside the gamepad wrapper")
+
+
+def main():
+    args = sys.argv[1:]
+    podman = next_podman()
+    extra = []
+    if os.environ.get("FRAMEPORT_NO_GAMEPAD", "0") in ("", "0"):
+        try:
+            extra = mounts(args)
+        except Exception as exc:  # never keep the game from starting
+            log(f"container left unchanged: {exc}")
+            extra = []
+    os.execv(podman, [podman, *(args[:1] + extra + args[1:] if extra else args)])
+
+
+if __name__ == "__main__":
+    main()
+'''
 
 
 class AgentError(Exception):
@@ -2216,6 +2398,7 @@ export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 export IS_PARENT=true
 {extra_env}
 {video_codec}
+{gamepad}
 child=''
 stop() {{
     trap - EXIT INT TERM
@@ -2297,6 +2480,10 @@ def upgrade_launchers():
         # launchers are never touched). Running launchers keep reading their old file.
         if "export LEPTON_ENV_FRAMEBRIDGE_CONFIG=" in new:
             new = set_codec_line(new, wants_hw_video(os.path.dirname(path)))
+            want_pad = wants_gamepad(os.path.dirname(path))
+            if want_pad:
+                ensure_gamepad_files()
+            new = set_gamepad_line(new, want_pad)
         if "a Linux app. Generated by FramePort" in new and "FRAMEPORT_DESKTOP" not in new:
             new = upgrade_linux_launcher(new)
         if OLD_WATCHDOG in new and "parent=$PPID" not in new:
@@ -2377,6 +2564,54 @@ def set_codec_line(text, want):
     return text
 
 
+def wants_gamepad(anchor):
+    """Whether this game's launcher gets the gamepad line (frame.gamepad_passthrough): deployment.json's choice
+    (written at finalize), else its recipe's patches."""
+    try:
+        with open(os.path.join(anchor, "deployment.json")) as f:
+            dep = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(dep, dict):
+        return False
+    if "gamepad_passthrough" in dep:
+        return bool(dep["gamepad_passthrough"])
+    recipe = dep.get("recipe") if isinstance(dep.get("recipe"), dict) else {}
+    return GAMEPAD_PATCH in (recipe.get("patches") or [])
+
+
+def set_gamepad_line(text, want):
+    """A Lepton launcher with the gamepad line (want) or without it. It goes last before Lepton starts, after the
+    codec line, so the gamepad wrapper comes first on PATH and chains on to the codec wrapper."""
+    while GAMEPAD_LINE + "\n" in text:
+        text = text.replace(GAMEPAD_LINE + "\n", "", 1)
+    if want:
+        for anchor in ("\nchild=''\n", "\nsetsid "):
+            if anchor in text:
+                at = text.index(anchor) + 1
+                text = text[:at] + GAMEPAD_LINE + "\n" + text[at:]
+                break
+    return text
+
+
+def ensure_gamepad_files():
+    """The gamepad wrapper and key layout in GAMEPAD_DIR, rewritten when this agent's copy differs."""
+    os.makedirs(os.path.join(GAMEPAD_DIR, "bin"), exist_ok=True)
+    for rel, content, mode in (("bin/podman", GAMEPAD_PODMAN, 0o755),
+                               ("Vendor_28de_Product_11ff.kl", GAMEPAD_KEYLAYOUT, 0o644)):
+        path = os.path.join(GAMEPAD_DIR, rel)
+        try:
+            with open(path) as f:
+                if f.read() == content and (os.stat(path).st_mode & 0o777) == mode:
+                    continue
+        except OSError:
+            pass
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            f.write(content)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+
 def remove_old_codec_dirs():
     """Agent <= 70 extracted a per-game codec into <base>/frameport-codec; the shared codec replaced it. Removed
     once the game's launcher no longer uses it (upgrade_launchers converted it; the choice is in deployment.json or
@@ -2430,15 +2665,18 @@ def upgrade_linux_launcher(text):
     return text
 
 
-def write_launcher(anchor, base, pkg, title, appid, lepton, env, hw_video=False):
+def write_launcher(anchor, base, pkg, title, appid, lepton, env, hw_video=False, gamepad=False):
     extra = "".join(f"export {k}={shlex.quote(str(v))}\n" for k, v in (env or {}).items()
                     if re.fullmatch(r"[A-Z_][A-Z0-9_]*", k))
     text = LAUNCH_SH.format(title=title.replace("\n", " "), pkg=pkg, base_q=shlex.quote(base), appid=appid,
                             lepton_q=shlex.quote(lepton), extra_env=extra, watchdog=WATCHDOG,
                             dashboard=dashboard_line(), logcat=logcat_line(), single=SINGLE_LINE,
                             video_codec=VIDEO_CODEC_LINE if hw_video else "",
+                            gamepad=GAMEPAD_LINE if gamepad else "",
                             plays_start=plays_lines(anchor)[0],
                             plays_end=plays_lines(anchor)[1])
+    if gamepad:
+        ensure_gamepad_files()
     path = os.path.join(anchor, "launch.sh")
     with open(path + ".tmp", "w") as f:
         f.write(text)
@@ -2640,7 +2878,8 @@ def cmd_finalize(args):
     models = install_controller_models(files_dir, str(settings.get("controller_models", 0)) not in ("0", "0.0"))
     recipe = args.get("recipe") if isinstance(args.get("recipe"), dict) else {}
     hw_video = HW_VIDEO_PATCH in (recipe.get("patches") or [])  # the shared codec (install_video_codec)
-    write_launcher(anchor, base, pkg, title, appid, lepton, args.get("env"), hw_video)
+    gamepad = GAMEPAD_PATCH in (recipe.get("patches") or [])  # Steam Input's gamepads into the container
+    write_launcher(anchor, base, pkg, title, appid, lepton, args.get("env"), hw_video, gamepad)
     art_in = os.path.join(base, "incoming-artwork")
     if os.path.isdir(art_in):
         shutil.rmtree(os.path.join(anchor, "artwork"), ignore_errors=True)
@@ -2648,7 +2887,8 @@ def cmd_finalize(args):
     dep = {"package": pkg, "appid": int(appid), "base": base, "title": title, "tags": args.get("tags") or [],
            "apk": args.get("apk_name", "game.apk"),
            "sha256": args.get("apk_sha256"), "recipe": args.get("recipe"), "installed_by": "frameport",
-           "hw_video_decode": hw_video, "agent_version": AGENT_VERSION, "time": time.time()}
+           "hw_video_decode": hw_video, "gamepad_passthrough": gamepad, "agent_version": AGENT_VERSION,
+           "time": time.time()}
     with open(os.path.join(anchor, "deployment.json"), "w") as f:
         json.dump(dep, f, indent=2)
     return {"ok": True, "base": base, "appid": appid, "moved_data_files": moved, "controller_models": models}
